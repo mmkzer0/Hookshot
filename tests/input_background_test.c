@@ -195,6 +195,39 @@ static void frame_clock_case(const char *name) {
     CHECK(origin_logs == (wall ? 0 : 1));
 }
 
+/* HOS_INPUT_RECORD writes what the game read at each change (the Python side compares the file); HOS_INPUT_REPLAY plays
+   such a file back by the game's reads (or frames) and drives the game alone until 10 s after its last line */
+static void record_replay_case(const char *name) {
+    const uint64_t physical = (1ULL << B_B) | (1ULL << B_X);
+    if (!strcmp(name, "record")) {
+        packet(1ULL << B_A, 0, 32767, 0);
+        now_ns += 201000000;
+        hos_present_count += 12;
+        packet(0, 0, 0, 0);
+        packet(0, 0, 0, 0);   /* (no change: no line) */
+        return;
+    }
+    front = 1;
+    if (!strcmp(name, "replay-bad")) {   /* a broken record is no replay: the player's devices count */
+        packet(physical, 32767, 0, 8000);
+        CHECK(nreplay == 0);
+        return;
+    }
+    packet(1ULL << B_A, 0, 32767, 0);
+    if (!strcmp(name, "replay-frames")) {
+        packet(1ULL << B_A, 0, 32767, 0);   /* (the second read, but the same frame) */
+        hos_present_count += 12;
+    }
+    packet(0, 0, 0, 0);
+    CHECK(strstr(last_log, "input replay at its last line"));
+    now_ns += 9000000000LL;
+    packet(0, 0, 0, 0);   /* (the last line holds) */
+    CHECK(pad_merges == 0 && key_queries == 0 && mouse_queries == 0);
+    now_ns += 1100000000LL;
+    packet(physical, 32767, 0, 8000);
+    CHECK(pad_merges > 0 && replay_end_ns < 0);
+}
+
 int main(int argc, char **argv) {
     CHECK(argc == 2);
     CHECK(!pads_in_background(NULL, 0));   /* out of the box: the window in front only */
@@ -207,6 +240,13 @@ int main(int argc, char **argv) {
         !strcmp(name, "wall") || !strcmp(name, "zero") || !strcmp(name, "empty")) {
         frame_clock_case(name);
         printf("PASS: actual input frame clock %s\n", name);
+        free(memory);
+        return 0;
+    }
+    if (!strcmp(name, "record") || !strncmp(name, "replay", 6)) {
+        record_replay_case(name);
+        CHECK(bootstrap_polls == 1);
+        printf("PASS: actual input record and replay %s\n", name);
         free(memory);
         return 0;
     }

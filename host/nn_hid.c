@@ -20,7 +20,8 @@
 
    HOS_INPUT_SCRIPT (test runs): timed presses added to the input, "<seconds>:<button>[+<button>...][/<ms held>],..."
    with buttons A B X Y L R ZL ZR PLUS MINUS LS RS LEFT UP RIGHT DOWN and the stick directions LUP LDOWN LLEFT
-   LRIGHT RUP RDOWN RLEFT RRIGHT; held 200 ms unless given. Example: "50:A,52:A,80:LUP/4000".
+   LRIGHT RUP RDOWN RLEFT RRIGHT; held 200 ms unless given. Example: "50:A,52:A,80:LUP/4000". HOS_INPUT_RECORD and
+   HOS_INPUT_REPLAY record what the game read and play it back (record_input, replayed_input).
 
    Npad states share one layout (NpadCommonState): { s64 sampling; u64 buttons; s32 lx, ly; s32 rx, ry; u32 attributes;
    pad } = 0x28 bytes. */
@@ -493,6 +494,132 @@ static void host_taps(void) {
     if (text[0]) parse_presses(text, script_elapsed_ms(hos_now_ns()), 1);
 }
 
+/* HOS_INPUT_RECORD=<file> and HOS_INPUT_REPLAY=<file> (test runs: the player's way to a bug, played again without
+   them). A record is what the game read from No.1 (every device's and the script's input together), a line at each
+   change: "<read> <ms> <frame> <buttons, hex> <lx> <ly> <rx> <ry>", read counting the game's reads of No.1 from 1, ms
+   the wall clock and frame the native presents since the first read. Each line is flushed, so a record survives the
+   game's crash. A replay plays a record back by HOS_INPUT_REPLAY_CLOCK: reads (default: the game reads the pad once a
+   frame of its own logic, so a stall in a shader compile or a load does not move the presses), frames or ms. While it
+   plays it drives the game alone (the script's presses add to it); its last line holds for 10 s of wall clock after it
+   is reached, then the player's devices count again. Recording a replay gives the same read and input columns, and
+   its ms and frame columns show how far the run drifted from the recorded one. */
+typedef struct { int64_t at[3]; uint64_t buttons; int32_t stick[4]; } Recorded;
+static int64_t input_reads, input_t0 = -1, input_frame0;
+static Recorded *replay;
+static int nreplay = -1, replay_clock, replay_next;
+static int64_t replay_end_ns;
+
+static void input_clocks(int64_t at[3]) {
+    const int64_t now = hos_now_ns(), frame = InterlockedCompareExchange64(&hos_present_count, 0, 0);
+    if (input_t0 < 0) input_t0 = now, input_frame0 = frame;
+    at[0] = input_reads;
+    at[1] = (now - input_t0) / 1000000;
+    at[2] = frame - input_frame0;
+}
+
+static void replay_load(void) {
+    nreplay = 0;
+    const char *path = getenv("HOS_INPUT_REPLAY");
+    if (!path || !*path) return;
+    static const char *const clocks[3] = {"reads", "ms", "frames"};
+    const char *clock = getenv("HOS_INPUT_REPLAY_CLOCK");
+    for (int i = 0; clock && *clock && i < 3; i++)
+        if (!strcmp(clock, clocks[i])) replay_clock = i;
+    if (clock && *clock && strcmp(clock, clocks[replay_clock]))
+        hos_log("hid: HOS_INPUT_REPLAY_CLOCK=%s is none of reads, ms, frames: reads", clock);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        hos_log("hid: the input replay %s could not be read: no replay", path);
+        return;
+    }
+    char line[256];
+    int capacity = 0, bad = 0, unsorted = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        Recorded r;
+        long long t[3];
+        unsigned long long b;
+        if (sscanf(line, "%lld %lld %lld %llx %d %d %d %d", &t[0], &t[1], &t[2], &b, &r.stick[0], &r.stick[1],
+                   &r.stick[2], &r.stick[3]) != 8) {
+            bad++;
+            continue;
+        }
+        for (int k = 0; k < 3; k++) r.at[k] = t[k];
+        r.buttons = b;
+        if (nreplay && r.at[replay_clock] < replay[nreplay - 1].at[replay_clock]) unsorted++;
+        if (nreplay == capacity) {
+            capacity = capacity ? capacity * 2 : 1024;
+            Recorded *grown = realloc(replay, (size_t)capacity * sizeof *replay);
+            if (!grown) break;
+            replay = grown;
+        }
+        replay[nreplay++] = r;
+    }
+    fclose(f);
+    if (bad || unsorted) {   /* (a broken record replays as nothing, not as something else) */
+        hos_log("hid: the input replay %s has %d lines that are no record and %d out of order: no replay", path, bad, unsorted);
+        nreplay = 0;
+        return;
+    }
+    hos_log("hid: input replay of %d changes by %s (last at %lld)", nreplay, clocks[replay_clock],
+            nreplay ? (long long)replay[nreplay - 1].at[replay_clock] : 0LL);
+}
+
+/* whether the replay plays: its input is added, and then it drives the game alone */
+static int replayed_input(uint64_t *buttons, int32_t stick[4]) {
+    if (nreplay < 0) replay_load();
+    if (!nreplay || replay_end_ns < 0) return 0;
+    int64_t at[3];
+    input_clocks(at);
+    while (replay_next < nreplay && replay[replay_next].at[replay_clock] <= at[replay_clock]) replay_next++;
+    if (replay_next == nreplay) {
+        const int64_t now = hos_now_ns();
+        if (!replay_end_ns) {
+            replay_end_ns = now + 10000000000LL;
+            hos_log("hid: input replay at its last line (read %lld, %lld ms, frame %lld; recorded: read %lld, %lld ms, "
+                    "frame %lld); it holds 10 s", (long long)at[0], (long long)at[1], (long long)at[2],
+                    (long long)replay[nreplay - 1].at[0], (long long)replay[nreplay - 1].at[1],
+                    (long long)replay[nreplay - 1].at[2]);
+        } else if (now >= replay_end_ns) {
+            replay_end_ns = -1;
+            hos_log("hid: input replay over: the player's devices count again");
+            return 0;
+        }
+    }
+    if (replay_next) {
+        const Recorded *r = &replay[replay_next - 1];
+        *buttons |= r->buttons;
+        for (int k = 0; k < 4; k++)
+            if (r->stick[k]) stick[k] = r->stick[k];
+    }
+    return 1;
+}
+
+static void record_input(uint64_t buttons, const int32_t stick[4]) {
+    static FILE *f;
+    static int looked, any;
+    static uint64_t last_buttons;
+    static int32_t last_stick[4];
+    if (!looked) {
+        looked = 1;
+        const char *path = getenv("HOS_INPUT_RECORD");
+        if (path && *path) {
+            f = fopen(path, "w");
+            if (f) fputs("# hookshot input record (host/nn_hid.c): read ms frame buttons lx ly rx ry\n", f);
+            hos_log("hid: recording the input to %s%s", path, f ? "" : ": the file could not be made");
+        }
+    }
+    if (!f || (any && buttons == last_buttons && !memcmp(stick, last_stick, sizeof last_stick))) return;
+    any = 1;
+    last_buttons = buttons;
+    memcpy(last_stick, stick, sizeof last_stick);
+    int64_t at[3];
+    input_clocks(at);
+    fprintf(f, "%lld %lld %lld %llx %d %d %d %d\n", (long long)at[0], (long long)at[1], (long long)at[2],
+            (unsigned long long)buttons, (int)stick[0], (int)stick[1], (int)stick[2], (int)stick[3]);
+    fflush(f);
+}
+
 static void stick_max(int32_t stick[4], const int32_t v[4]) {
     for (int i = 0; i < 4; i++)
         if ((v[i] < 0 ? -v[i] : v[i]) > (stick[i] < 0 ? -stick[i] : stick[i])) stick[i] = v[i];
@@ -951,7 +1078,9 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     *buttons = 0;
     memset(stick, 0, 4 * sizeof *stick);
     void hos_mouse_native_stick(int held);
+    input_reads++;   /* (the replay's and the record's clock) */
     scripted_input(buttons, stick);
+    if (replayed_input(buttons, stick)) return;   /* (HOS_INPUT_REPLAY: the record alone while it plays) */
     /* (hookshot) HOS_CONTROL: the control bridge's presses (host/control.c); one that asked to be exclusive keeps the
        player's devices out while it lasts */
     if (hos_control_input(buttons, stick)) return;
@@ -1071,6 +1200,7 @@ static void npad_states(Ctx *c) {
     }
     if (connected) {
         read_input(&buttons, stick);
+        record_input(buttons, stick);   /* (HOS_INPUT_RECORD) */
         uint64_t axes = 0;
         uint64_t flight = 0;
         int height = 0;

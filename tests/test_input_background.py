@@ -27,7 +27,11 @@ RUN_ALL_ARGS = ["--cc", "gcc"]
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("foreground", "script-background", "headless", "noactivate", "live-background",
          "no-script-background", "exclusive-foreground", "exclusive-background", "pads-env", "pads-menu", "pads-off",
-         "frame-hold", "live-frame", "reuse-frame", "wall", "zero", "empty")
+         "frame-hold", "live-frame", "reuse-frame", "wall", "zero", "empty",
+         "record", "replay", "replay-frames", "replay-bad")
+REPLAYS = ("replay", "replay-frames", "replay-bad")
+# (the record of the "record" case: the script's A and left stick up for 200 ms, then nothing; read, ms, frame)
+RECORD = "# hookshot input record (host/nn_hid.c): read ms frame buttons lx ly rx ry\n1 0 0 1 0 32767 0 0\n2 201 12 0 0 0 0 0\n"
 
 
 def block(text, marker):
@@ -75,6 +79,9 @@ def main():
     start = hid.index("typedef struct { int64_t start_ms, end_ms;")
     script = block(hid, "static void scripted_input(")
     end = hid.index(script) + len(script)
+    # (the record and replay follow the host's taps, which host_spies stands in for)
+    recorded = block(hid, "static void record_input(")
+    records = hid[hid.index("/* HOS_INPUT_RECORD=<file>"):hid.index(recorded) + len(recorded)]
     cheat_state = re.search(r"^static uint64_t flight_input;\nstatic uint64_t free_camera_axes;\nstatic int free_camera_height;\n"
                             r"static int move_stick_held;", hid, re.M).group(0)
     cheat_spies = """
@@ -91,7 +98,7 @@ static void host_drag_read(int32_t stick[4]) { (void)stick; }
 static void player_used(void) {}
 """
     actual = "\n".join((cheat_state, cheat_spies, host_spies, block(hid, "static int key("), block(hid, "static int kmap_down("),
-        block(hid, "static int game_in_front("), hid[start:end], block(hid, "static void stick_max("),
+        block(hid, "static int game_in_front("), hid[start:end], records, block(hid, "static void stick_max("),
         block(hid, "static int pads_in_background("),
         # (the bound keys' helpers read_input calls: a mouse button counts only while the mouse is captured)
         block(hid, "static int mouse_vk_slot("), re.search(r"^static int mouse_armed\[5\];", hid, re.M).group(0),
@@ -124,7 +131,7 @@ static void player_used(void) {}
              "-I" + str(folder), str(ROOT / "tests/input_background_test.c"), "-o", str(exe)])
         for case in ((a.case,) if a.case else CASES):
             case_env = dict(env)
-            if case not in ("live-background", "no-script-background", "live-frame", "reuse-frame"):
+            if case not in ("live-background", "no-script-background", "live-frame", "reuse-frame") + REPLAYS:
                 case_env["HOS_INPUT_SCRIPT"] = "0:A+LUP/200"
             if case in ("frame-hold", "live-frame", "reuse-frame"):
                 case_env["HOS_INPUT_FRAME_CLOCK"] = "1"
@@ -142,7 +149,19 @@ static void player_used(void) {}
                 live = folder / (case + ".txt")
                 live.write_bytes(b"")
                 case_env["HOS_INPUT_LIVE"] = str(live)
+            if case == "record":
+                case_env["HOS_INPUT_RECORD"] = str(folder / "record.txt")
+            if case in REPLAYS:
+                replay = folder / (case + ".txt")
+                replay.write_text(RECORD + ("nonsense\n" if case == "replay-bad" else ""), encoding="utf-8", newline="\n")
+                case_env["HOS_INPUT_REPLAY"] = str(replay)
+                if case == "replay-frames":
+                    case_env["HOS_INPUT_REPLAY_CLOCK"] = "frames"
             run([str(exe), case], case_env)
+            if case == "record":
+                written = (folder / "record.txt").read_text(encoding="utf-8")
+                if written != RECORD:
+                    raise SystemExit(f"the record is\n{written}instead of\n{RECORD}")
         assert folder.parent == Path(tempfile.gettempdir()).resolve() and folder.name.startswith("input-background-")
 
 
